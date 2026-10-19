@@ -40,6 +40,8 @@
   const lbCompFig = $('#lbCompFig');
   const lbOrigCap = $('#lbOrigCap');
   const lbCompCap = $('#lbCompCap');
+  const lbClose = $('.lightbox-close');
+  let lastFocused = null;
 
   // ---------- State ----------
   let items = [];        // { id, file, name, originalSize, width, height, source, isBitmap, status, compressedBlob, compressedSize, warnings, error, els }
@@ -80,6 +82,17 @@
     if (t === 'image/heic' || t === 'image/heif') return true;
     const e = extOf(file.name);
     return e === 'heic' || e === 'heif';
+  }
+
+  // 探测浏览器是否支持 WebP 编码（部分旧版 Safari / WebView 不支持）
+  function supportsWebpEncode() {
+    try {
+      const c = document.createElement('canvas');
+      c.width = c.height = 1;
+      return c.toDataURL('image/webp').indexOf('data:image/webp') === 0;
+    } catch (_) {
+      return false;
+    }
   }
 
   function toast(msg, type) {
@@ -204,6 +217,7 @@
           item.compressedSize = blob.size;
           item.compressedWidth = w;
           item.compressedHeight = h;
+          item.compressedFormat = p.format;
           item._outUrl = URL.createObjectURL(blob);
           item.status = 'done';
           updateCardStatus(item);
@@ -231,11 +245,11 @@
       <div class="previews">
         <div class="preview-wrap">
           <span class="preview-tag">原图</span>
-          <div class="preview"><img alt="原图预览" /></div>
+          <div class="preview orig-preview"><img alt="原图预览" /></div>
         </div>
         <div class="preview-wrap">
           <span class="preview-tag">压缩后</span>
-          <div class="preview"><img alt="压缩后预览" /></div>
+          <div class="preview comp-preview"><img alt="压缩后预览" /></div>
         </div>
       </div>
       <div class="stats">
@@ -253,8 +267,8 @@
     item.els = {
       card,
       warn: card.querySelector('.card-warn'),
-      origImg: card.querySelector('.preview img'),
-      compImg: card.querySelectorAll('.preview img')[1],
+      origImg: card.querySelector('.orig-preview img'),
+      compImg: card.querySelector('.comp-preview img'),
       orig: card.querySelector('[data-orig]'),
       comp: card.querySelector('[data-comp]'),
       ratio: card.querySelector('[data-ratio]'),
@@ -344,9 +358,12 @@
 
   // ---------- Lightbox 预览 ----------
   function openPreview(item) {
+    lastFocused = document.activeElement;
     lbTitle.textContent = item.name;
     lbOrig.src = item._inUrl;
     lbOrigCap.textContent = `${item.width || '?'}×${item.height || '?'} · ${formatBytes(item.originalSize)}`;
+    // 复位压缩后图状态
+    lbComp.style.display = '';
 
     if (item.status === 'done' && item._outUrl) {
       lbCompFig.style.display = '';
@@ -357,14 +374,20 @@
         + (pct >= 0 ? `（↓${pct.toFixed(1)}%）` : `（↑${Math.abs(pct).toFixed(1)}%）`);
     } else if (item.status === 'error') {
       lbCompFig.style.display = '';
-      lbComp.removeAttribute('src');
-      lbCompCap.textContent = '压缩失败';
+      lbComp.style.display = 'none';
+      lbCompCaptionFallback('压缩失败');
     } else {
       lbCompFig.style.display = 'none';
     }
 
     lightbox.classList.remove('hidden');
     document.body.style.overflow = 'hidden';
+    if (lbClose) lbClose.focus();
+  }
+
+  // 在隐藏压缩图时，把说明文字交给 figure 的 caption 显示
+  function lbCompCaptionFallback(text) {
+    lbCompCap.textContent = text;
   }
 
   function closePreview() {
@@ -373,6 +396,9 @@
     lbOrig.removeAttribute('src');
     lbComp.removeAttribute('src');
     document.body.style.overflow = '';
+    if (lastFocused && typeof lastFocused.focus === 'function') {
+      try { lastFocused.focus(); } catch (_) {}
+    }
   }
 
   lightbox.addEventListener('click', (e) => {
@@ -500,29 +526,31 @@
   }
 
   // ---------- Download ----------
-  function outName(item, format) {
+  function outName(item) {
     const base = (item.name.replace(/\.[^.]+$/, '') || 'image');
-    return base + '.' + (EXT[format] || 'img');
+    const fmt = item.compressedFormat || getParams().format;
+    return base + '.' + (EXT[fmt] || 'img');
   }
 
   function downloadOne(item) {
     if (item.status !== 'done' || !item.compressedBlob) return;
+    const url = URL.createObjectURL(item.compressedBlob);
     const a = document.createElement('a');
-    a.href = item._outUrl;
-    a.download = outName(item, getParams().format);
+    a.href = url;
+    a.download = outName(item);
     document.body.appendChild(a);
     a.click();
     a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
   async function downloadAll() {
     const done = items.filter((i) => i.status === 'done' && i.compressedBlob);
     if (!done.length) { toast('暂无可下载的压缩结果', 'warn'); return; }
-    const format = getParams().format;
-    // 去重文件名（同名追加 _1, _2 ...）
+    // 去重文件名（同名追加 _1, _2 ...），按各图实际编码格式命名
     const seen = {};
     const files = done.map((item) => {
-      let n = outName(item, format);
+      let n = outName(item);
       if (seen[n] !== undefined) {
         const cnt = ++seen[n];
         n = n.replace(/(\.[^.]+)$/, '_' + cnt + '$1');
@@ -533,18 +561,30 @@
     });
     toast('正在打包 ZIP…');
     const zip = await buildZip(files);
+    const url = URL.createObjectURL(zip);
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(zip);
+    a.href = url;
     a.download = 'tinyshot_compressed.zip';
     document.body.appendChild(a);
     a.click();
     a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
   }
 
   function clearAll() {
-    items.slice().forEach(removeItem);
+    items.slice().forEach((item) => {
+      if (item._inUrl) URL.revokeObjectURL(item._inUrl);
+      if (item._outUrl) URL.revokeObjectURL(item._outUrl);
+      if (item.isBitmap && item.source && item.source.close) {
+        try { item.source.close(); } catch (_) {}
+      }
+      if (item._canvas) item._canvas.width = item._canvas.height = 0;
+      if (item.els) item.els.card.remove();
+    });
+    items = [];
     fileInput.value = '';
+    refreshEmptyState();
+    updateSummary();
   }
 
   // ---------- Minimal ZIP (store, no compression) ----------
@@ -633,16 +673,32 @@
     return new Blob(all, { type: 'application/zip' });
   }
 
+  // 并发受控的批量执行：避免大批量图片同时解码/绘制造成内存与卡顿尖峰
+  async function mapPool(list, limit, fn) {
+    const queue = list.slice();
+    const runners = [];
+    const n = Math.max(1, Math.min(limit, queue.length));
+    for (let i = 0; i < n; i++) {
+      runners.push((async () => {
+        while (queue.length) {
+          const it = queue.shift();
+          try { await fn(it); } catch (_) { /* 单条失败不影响其余 */ }
+        }
+      })());
+    }
+    await Promise.all(runners);
+  }
+
   // ---------- Recompress all (param change) ----------
-  function recompressAll() {
-    items.forEach((item) => {
-      if (item.source && item.width) compressItem(item);
-    });
+  async function recompressAll() {
+    const todo = items.filter((i) => i.source && i.width);
+    if (!todo.length) return;
+    await mapPool(todo, 4, (item) => compressItem(item));
   }
 
   function scheduleRecompress() {
     clearTimeout(recompressTimer);
-    recompressTimer = setTimeout(recompressAll, 160);
+    recompressTimer = setTimeout(() => { recompressAll(); }, 160);
   }
 
   // ---------- Events ----------
@@ -718,6 +774,14 @@
   $('#clearAll').addEventListener('click', clearAll);
 
   // ---------- Init ----------
+  if (!supportsWebpEncode()) {
+    const opt = formatSel.querySelector('option[value="image/webp"]');
+    if (opt) {
+      opt.disabled = true;
+      opt.textContent = 'WebP（当前浏览器不支持）';
+    }
+    if (formatSel.value === 'image/webp') formatSel.value = 'image/jpeg';
+  }
   updateFormatUI();
   refreshEmptyState();
 })();
