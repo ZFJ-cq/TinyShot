@@ -3,6 +3,8 @@
 /* ============================================================
  * TinyShot — 纯前端本地图片压缩
  * 所有处理均在浏览器内完成，不发起任何网络请求。
+ * 编码（drawImage / toBlob）默认在 Web Worker + OffscreenCanvas
+ * 中执行（UI 不卡顿）；不支持时自动回退主线程。
  * ============================================================ */
 
 (function () {
@@ -16,6 +18,7 @@
   const quality = $('#quality');
   const qualityValue = $('#qualityValue');
   const qualityNote = $('#qualityNote');
+  const estimateEl = $('#estimate');
   const formatSel = $('#format');
   const formatNote = $('#formatNote');
   const segBtns = document.querySelectorAll('.seg-btn');
@@ -24,6 +27,13 @@
   const percentInput = $('#percent');
   const maxWInput = $('#maxW');
   const maxHInput = $('#maxH');
+
+  // 目标体积模式
+  const targetToggle = $('#targetToggle');
+  const targetFields = $('#targetFields');
+  const targetKb = $('#targetKb');
+  const applyTarget = $('#applyTarget');
+
   const toastWrap = $('#toastWrap');
 
   // summary nodes
@@ -31,22 +41,32 @@
   const sumCompressed = $('#sumCompressed');
   const sumSaved = $('#sumSaved');
   const sumSavedLabel = $('#sumSavedLabel');
+  const progress = $('#progress');
+  const progressFill = $('#progressFill');
+  const progressText = $('#progressText');
+  const stopBtn = $('#stopBtn');
 
-  // lightbox
+  // lightbox（对比滑杆）
   const lightbox = $('#lightbox');
   const lbTitle = $('#lbTitle');
-  const lbOrig = $('#lbOrig');
-  const lbComp = $('#lbComp');
-  const lbCompFig = $('#lbCompFig');
-  const lbOrigCap = $('#lbOrigCap');
-  const lbCompCap = $('#lbCompCap');
+  const lbCompare = $('#lbCompare');
+  const lbOrig2 = $('#lbOrig2');
+  const lbComp2 = $('#lbComp2');
+  const lbCap = $('#lbCap');
+  const lbFallback = $('#lbFallback');
   const lbClose = $('.lightbox-close');
   let lastFocused = null;
 
+  // theme / mobile
+  const themeToggle = $('#themeToggle');
+  const paramsFab = $('#paramsFab');
+  const paramsClose = $('#paramsClose');
+
   // ---------- State ----------
-  let items = [];        // { id, file, name, originalSize, width, height, source, isBitmap, status, compressedBlob, compressedSize, warnings, error, els }
+  let items = [];
   let idSeq = 0;
   let recompressTimer = null;
+  const progressState = { active: false, done: 0, total: 0, token: 0 };
 
   const EXT = {
     'image/jpeg': 'jpg',
@@ -55,9 +75,9 @@
   };
 
   // 友好提示阈值
-  const WARN_DIM = 8000;          // 单边超过此像素
-  const WARN_PIXELS = 80_000_000; // 总像素超过 8000 万（约 80MP）
-  const WARN_FILE = 25 * 1024 * 1024; // 单文件 > 25MB
+  const WARN_DIM = 8000;
+  const WARN_PIXELS = 80_000_000;
+  const WARN_FILE = 25 * 1024 * 1024;
 
   // ---------- Utils ----------
   function formatBytes(bytes, { sign = false } = {}) {
@@ -84,7 +104,6 @@
     return e === 'heic' || e === 'heif';
   }
 
-  // 探测浏览器是否支持 WebP 编码（部分旧版 Safari / WebView 不支持）
   function supportsWebpEncode() {
     try {
       const c = document.createElement('canvas');
@@ -119,9 +138,100 @@
     };
   }
 
+  // ---------- Worker（内联，兼容 file://） ----------
+  const WORKER_SRC = `
+    self.onmessage = async (e) => {
+      const d = e.data;
+      try {
+        const { id, width, height, params, bitmap } = d;
+        const canvas = new OffscreenCanvas(width, height);
+        const ctx = canvas.getContext('2d');
+        if (params.format === 'image/jpeg') {
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0, 0, width, height);
+        } else {
+          ctx.clearRect(0, 0, width, height);
+        }
+        ctx.drawImage(bitmap, 0, 0, width, height);
+        if (bitmap.close) bitmap.close();
+        const blob = await canvas.convertToBlob({ type: params.format, quality: params.quality });
+        if (!blob) { self.postMessage({ id, ok: false, error: 'null-blob' }); return; }
+        const buf = await blob.arrayBuffer();
+        self.postMessage({ id, ok: true, size: blob.size, buffer: buf }, [buf]);
+      } catch (err) {
+        self.postMessage({ id: d.id, ok: false, error: String((err && err.message) || err) });
+      }
+    };
+  `;
+
+  let worker = null;
+  let WORKER_OK = false;
+  let msgSeq = 0;
+  const pending = new Map();
+
+  function initWorker() {
+    try {
+      if (typeof Worker === 'undefined' || typeof OffscreenCanvas === 'undefined') return;
+      if (typeof OffscreenCanvas.prototype.convertToBlob !== 'function') return;
+      const url = URL.createObjectURL(new Blob([WORKER_SRC], { type: 'application/javascript' }));
+      worker = new Worker(url);
+      worker.onmessage = (e) => {
+        const { id, ok, size, buffer, error } = e.data;
+        const p = pending.get(id);
+        if (!p) return;
+        pending.delete(id);
+        if (ok) p.resolve({ size, buffer });
+        else p.reject(new Error(error || 'worker-error'));
+      };
+      worker.onerror = () => { WORKER_OK = false; };
+      WORKER_OK = true;
+    } catch (_) {
+      WORKER_OK = false;
+    }
+  }
+
+  function workerCompress(bitmap, w, h, params) {
+    return new Promise((resolve, reject) => {
+      const id = ++msgSeq;
+      pending.set(id, { resolve, reject });
+      worker.postMessage({ id, width: w, height: h, params, bitmap }, [bitmap]);
+    });
+  }
+
+  // 主线程回退编码
+  function mainEncode(source, w, h, params) {
+    return new Promise((resolve, reject) => {
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      if (params.format === 'image/jpeg') {
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, w, h);
+      } else {
+        ctx.clearRect(0, 0, w, h);
+      }
+      try { ctx.drawImage(source, 0, 0, w, h); } catch (e) { reject(e); return; }
+      canvas.toBlob(
+        (blob) => (blob ? resolve(blob) : reject(new Error('null-blob'))),
+        params.format,
+        params.quality
+      );
+    });
+  }
+
+  // 统一编码入口（返回 {blob, size}）
+  async function encodeItem(item, p, w, h) {
+    if (WORKER_OK && item.source) {
+      const clone = await createImageBitmap(item.source);
+      const r = await workerCompress(clone, w, h, p);
+      return { blob: new Blob([r.buffer], { type: p.format }), size: r.size };
+    }
+    const blob = await mainEncode(item.source, w, h, p);
+    return { blob, size: blob.size };
+  }
+
   // ---------- Decode ----------
   async function decodeFile(file) {
-    // 优先 createImageBitmap，可尊重 EXIF 方向，且支持更多格式
     if (window.createImageBitmap) {
       try {
         const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
@@ -142,7 +252,6 @@
     }
   }
 
-  // ---------- Compute target dimensions ----------
   function targetSize(item, p) {
     let w = item.width, h = item.height;
     if (p.mode === 'percent') {
@@ -153,7 +262,7 @@
       const ratio = w / h;
       let tw = w, th = h;
       if (p.maxW && p.maxH) {
-        const r = Math.min(p.maxW / w, p.maxH / h, 1); // 不放大
+        const r = Math.min(p.maxW / w, p.maxH / h, 1);
         tw = Math.max(1, Math.round(w * r));
         th = Math.max(1, Math.round(h * r));
       } else if (p.maxW) {
@@ -171,62 +280,29 @@
   }
 
   // ---------- Compress ----------
-  function compressItem(item) {
+  async function compressItem(item) {
     const p = getParams();
     item.status = 'processing';
     updateCardStatus(item);
 
     const { w, h } = targetSize(item, p);
 
-    // 离屏 canvas（按尺寸复用）
-    const canvas = item._canvas || (item._canvas = document.createElement('canvas'));
-    const ctx = canvas.getContext('2d');
-    canvas.width = w;
-    canvas.height = h;
-
-    if (p.format === 'image/jpeg') {
-      // JPEG 不支持透明，填充白底避免透明区域变黑
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, w, h);
-    } else {
-      ctx.clearRect(0, 0, w, h);
-    }
     try {
-      ctx.drawImage(item.source, 0, 0, w, h);
+      const { blob, size } = await encodeItem(item, p, w, h);
+      if (item._outUrl) URL.revokeObjectURL(item._outUrl);
+      item.compressedBlob = blob;
+      item.compressedSize = size;
+      item.compressedWidth = w;
+      item.compressedHeight = h;
+      item.compressedFormat = p.format;
+      item._outUrl = URL.createObjectURL(blob);
+      item.status = 'done';
+      updateCardStatus(item);
     } catch (e) {
       item.status = 'error';
-      item.error = '绘制失败：图片可能已损坏或过大。';
+      item.error = '压缩失败：当前格式或参数不被浏览器支持。';
       updateCardStatus(item);
-      return Promise.resolve();
     }
-
-    const q = p.format === 'image/png' ? undefined : p.quality;
-
-    return new Promise((resolve) => {
-      canvas.toBlob(
-        (blob) => {
-          if (!blob) {
-            item.status = 'error';
-            item.error = '压缩失败：当前格式或参数不被浏览器支持。';
-            updateCardStatus(item);
-            resolve();
-            return;
-          }
-          if (item._outUrl) URL.revokeObjectURL(item._outUrl);
-          item.compressedBlob = blob;
-          item.compressedSize = blob.size;
-          item.compressedWidth = w;
-          item.compressedHeight = h;
-          item.compressedFormat = p.format;
-          item._outUrl = URL.createObjectURL(blob);
-          item.status = 'done';
-          updateCardStatus(item);
-          resolve();
-        },
-        p.format,
-        q
-      );
-    });
   }
 
   // ---------- Card UI ----------
@@ -261,6 +337,7 @@
       </div>
       <div class="card-actions">
         <button class="btn btn-primary btn-sm" data-download>下载</button>
+        <button class="btn btn-ghost btn-sm" data-share>分享</button>
       </div>
     `;
 
@@ -275,10 +352,12 @@
       dim: card.querySelector('[data-dim]'),
       bar: card.querySelector('[data-bar]'),
       download: card.querySelector('[data-download]'),
+      share: card.querySelector('[data-share]'),
     };
 
     item.els.origImg.src = item._inUrl;
     item.els.download.addEventListener('click', () => downloadOne(item));
+    item.els.share.addEventListener('click', () => shareOne(item));
     card.querySelector('.card-remove').addEventListener('click', () => removeItem(item));
     card.querySelectorAll('.preview-wrap').forEach((pw) => {
       pw.classList.add('clickable');
@@ -297,6 +376,7 @@
       els.ratio.textContent = '—';
       els.bar.style.width = '0%';
       els.download.disabled = true;
+      els.share.disabled = true;
     } else if (item.status === 'error') {
       setProcessing(item, false);
       els.comp.textContent = '—';
@@ -304,6 +384,7 @@
       els.ratio.className = 'v bad';
       els.bar.style.width = '0%';
       els.download.disabled = true;
+      els.share.disabled = true;
       toast(item.error || '处理失败', 'error');
     } else if (item.status === 'done') {
       setProcessing(item, false);
@@ -317,12 +398,18 @@
       els.dim.textContent = `${item.compressedWidth}×${item.compressedHeight}`;
       els.bar.style.width = Math.max(0, Math.min(100, ratioPct)) + '%';
       els.download.disabled = false;
+      els.share.disabled = false;
+      // U4 实时预估：首图压缩完成后刷新提示
+      const rep = items.find((i) => i.source);
+      if (rep && rep === item) {
+        estimateEl.textContent = `预估首图 ≈ ${formatBytes(item.compressedSize)}（当前参数）`;
+      }
     }
     updateSummary();
   }
 
   function setProcessing(item, on) {
-    const wrap = item.els.compImg.parentElement; // .preview
+    const wrap = item.els.compImg.parentElement;
     let sp = wrap.querySelector('.spinner-overlay');
     if (on) {
       if (!sp) {
@@ -356,28 +443,38 @@
     ));
   }
 
-  // ---------- Lightbox 预览 ----------
+  // ---------- Lightbox 对比滑杆 ----------
+  let dragPos = false;
+  function setComparePos(clientX) {
+    const r = lbCompare.getBoundingClientRect();
+    let p = ((clientX - r.left) / r.width) * 100;
+    p = Math.max(0, Math.min(100, p));
+    lbCompare.style.setProperty('--pos', p + '%');
+  }
+
   function openPreview(item) {
     lastFocused = document.activeElement;
     lbTitle.textContent = item.name;
-    lbOrig.src = item._inUrl;
-    lbOrigCap.textContent = `${item.width || '?'}×${item.height || '?'} · ${formatBytes(item.originalSize)}`;
-    // 复位压缩后图状态
-    lbComp.style.display = '';
+    lbOrig2.src = item._inUrl;
+    lbCompare.style.setProperty('--pos', '50%');
+    lbFallback.hidden = true;
 
     if (item.status === 'done' && item._outUrl) {
-      lbCompFig.style.display = '';
-      lbComp.src = item._outUrl;
+      lbComp2.src = item._outUrl;
+      lbCompare.style.visibility = '';
       const saved = item.originalSize - item.compressedSize;
       const pct = item.originalSize ? (saved / item.originalSize) * 100 : 0;
-      lbCompCap.textContent = `${item.compressedWidth || '?'}×${item.compressedHeight || '?'} · ${formatBytes(item.compressedSize)}`
+      lbCap.textContent = `原图 ${item.width}×${item.height} · ${formatBytes(item.originalSize)}　|　压缩后 ${item.compressedWidth}×${item.compressedHeight} · ${formatBytes(item.compressedSize)}`
         + (pct >= 0 ? `（↓${pct.toFixed(1)}%）` : `（↑${Math.abs(pct).toFixed(1)}%）`);
+      lbCap.className = 'compare-caption ' + (pct >= 0 ? 'good' : 'bad');
     } else if (item.status === 'error') {
-      lbCompFig.style.display = '';
-      lbComp.style.display = 'none';
-      lbCompCaptionFallback('压缩失败');
+      lbCompare.style.visibility = 'hidden';
+      lbFallback.hidden = false;
+      lbFallback.textContent = '压缩失败';
     } else {
-      lbCompFig.style.display = 'none';
+      lbCompare.style.visibility = 'hidden';
+      lbFallback.hidden = false;
+      lbFallback.textContent = '处理中…';
     }
 
     lightbox.classList.remove('hidden');
@@ -385,21 +482,21 @@
     if (lbClose) lbClose.focus();
   }
 
-  // 在隐藏压缩图时，把说明文字交给 figure 的 caption 显示
-  function lbCompCaptionFallback(text) {
-    lbCompCap.textContent = text;
-  }
-
   function closePreview() {
     if (lightbox.classList.contains('hidden')) return;
     lightbox.classList.add('hidden');
-    lbOrig.removeAttribute('src');
-    lbComp.removeAttribute('src');
+    lbOrig2.removeAttribute('src');
+    lbComp2.removeAttribute('src');
     document.body.style.overflow = '';
     if (lastFocused && typeof lastFocused.focus === 'function') {
       try { lastFocused.focus(); } catch (_) {}
     }
   }
+
+  lbCompare.addEventListener('pointerdown', (e) => { dragPos = true; lbCompare.setPointerCapture(e.pointerId); setComparePos(e.clientX); });
+  lbCompare.addEventListener('pointermove', (e) => { if (dragPos) setComparePos(e.clientX); });
+  lbCompare.addEventListener('pointerup', () => { dragPos = false; });
+  lbCompare.addEventListener('pointercancel', () => { dragPos = false; });
 
   lightbox.addEventListener('click', (e) => {
     if (e.target.closest('[data-close]')) closePreview();
@@ -427,7 +524,6 @@
       item._inUrl = URL.createObjectURL(file);
       item.els.origImg.src = item._inUrl;
 
-      // 友好提示：格式 / 尺寸 / 体积
       const warnings = [];
       if (isHeic(file)) {
         warnings.push({
@@ -440,7 +536,7 @@
         warnings.push({ level: 'warn', text: '非常见图片格式，解码结果取决于浏览器支持。' });
       }
       if (item.originalSize > WARN_FILE) {
-        warnings.push({ level: 'warn', text: `文件较大（${formatBytes(item.originalSize)}），处理可能较慢。`, });
+        warnings.push({ level: 'warn', text: `文件较大（${formatBytes(item.originalSize)}），处理可能较慢。` });
       }
 
       try {
@@ -457,7 +553,6 @@
           warnings.push({ level: 'danger', text: `像素量极高（约 ${(item.width * item.height / 1e6).toFixed(0)}MP），可能超出浏览器画布上限而失败。` });
         }
         if (isHeic(file) && item.width === 0) {
-          // 某些浏览器 decode 不报错但返回 0 尺寸
           warnings.push({ level: 'danger', text: '浏览器未能读取该 HEIC 的像素数据，压缩可能失败。' });
         }
 
@@ -484,7 +579,6 @@
     if (item.isBitmap && item.source && item.source.close) {
       try { item.source.close(); } catch (_) {}
     }
-    if (item._canvas) item._canvas.width = item._canvas.height = 0;
     item.els.card.remove();
     items = items.filter((x) => x !== item);
     refreshEmptyState();
@@ -544,10 +638,29 @@
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
+  // F5 分享 / 复制
+  async function shareOne(item) {
+    if (item.status !== 'done' || !item.compressedBlob) return;
+    const file = new File([item.compressedBlob], outName(item), { type: item.compressedFormat });
+    try {
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: item.name });
+        return;
+      }
+      if (navigator.clipboard && window.ClipboardItem) {
+        await navigator.clipboard.write([new ClipboardItem({ [item.compressedFormat]: item.compressedBlob })]);
+        toast('已复制到剪贴板', 'ok');
+        return;
+      }
+      toast('当前环境不支持分享，请改用下载', 'warn');
+    } catch (e) {
+      /* 用户取消分享，忽略 */
+    }
+  }
+
   async function downloadAll() {
     const done = items.filter((i) => i.status === 'done' && i.compressedBlob);
     if (!done.length) { toast('暂无可下载的压缩结果', 'warn'); return; }
-    // 去重文件名（同名追加 _1, _2 ...），按各图实际编码格式命名
     const seen = {};
     const files = done.map((item) => {
       let n = outName(item);
@@ -578,13 +691,13 @@
       if (item.isBitmap && item.source && item.source.close) {
         try { item.source.close(); } catch (_) {}
       }
-      if (item._canvas) item._canvas.width = item._canvas.height = 0;
       if (item.els) item.els.card.remove();
     });
     items = [];
     fileInput.value = '';
     refreshEmptyState();
     updateSummary();
+    estimateEl.textContent = '预估首图 ≈ —';
   }
 
   // ---------- Minimal ZIP (store, no compression) ----------
@@ -614,16 +727,15 @@
       const name = enc.encode(f.name);
       const crc = crc32(data);
       const size = data.length;
-      // 语言编码标志：告知解压工具文件名按 UTF-8 解码（支持中文等）
       const gpFlag = 0x0800;
 
       const local = new DataView(new ArrayBuffer(30));
       local.setUint32(0, 0x04034b50, true);
       local.setUint16(4, 20, true);
       local.setUint16(6, gpFlag, true);
-      local.setUint16(8, 0, true);   // store
-      local.setUint16(10, 0, true);  // time
-      local.setUint16(12, 0, true);  // date
+      local.setUint16(8, 0, true);
+      local.setUint16(10, 0, true);
+      local.setUint16(12, 0, true);
       local.setUint32(14, crc, true);
       local.setUint32(18, size, true);
       local.setUint32(22, size, true);
@@ -637,8 +749,8 @@
       cd.setUint16(6, 20, true);
       cd.setUint16(8, gpFlag, true);
       cd.setUint16(10, 0, true);
-      cd.setUint16(12, 0, true); // last mod time
-      cd.setUint16(14, 0, true); // last mod date
+      cd.setUint16(12, 0, true);
+      cd.setUint16(14, 0, true);
       cd.setUint32(16, crc, true);
       cd.setUint32(20, size, true);
       cd.setUint32(24, size, true);
@@ -673,14 +785,14 @@
     return new Blob(all, { type: 'application/zip' });
   }
 
-  // 并发受控的批量执行：避免大批量图片同时解码/绘制造成内存与卡顿尖峰
-  async function mapPool(list, limit, fn) {
+  async function mapPool(list, limit, fn, shouldStop) {
     const queue = list.slice();
     const runners = [];
     const n = Math.max(1, Math.min(limit, queue.length));
     for (let i = 0; i < n; i++) {
       runners.push((async () => {
         while (queue.length) {
+          if (shouldStop && shouldStop()) return;
           const it = queue.shift();
           try { await fn(it); } catch (_) { /* 单条失败不影响其余 */ }
         }
@@ -689,16 +801,74 @@
     await Promise.all(runners);
   }
 
-  // ---------- Recompress all (param change) ----------
+  // ---------- F6 总进度 + 中断 ----------
+  function renderProgress() {
+    if (progressState.active && progressState.total > 0) {
+      progress.hidden = false;
+      const pct = Math.round((progressState.done / progressState.total) * 100);
+      progressFill.style.width = pct + '%';
+      progressText.textContent = `处理中 ${progressState.done}/${progressState.total}`;
+    } else {
+      progress.hidden = true;
+    }
+  }
+
   async function recompressAll() {
     const todo = items.filter((i) => i.source && i.width);
     if (!todo.length) return;
-    await mapPool(todo, 4, (item) => compressItem(item));
+    progressState.active = true;
+    progressState.done = 0;
+    progressState.total = todo.length;
+    progressState.token++;
+    const myToken = progressState.token;
+    renderProgress();
+    await mapPool(
+      todo, 4,
+      async (item) => {
+        if (progressState.token !== myToken) return;
+        await compressItem(item);
+        progressState.done++;
+        renderProgress();
+      },
+      () => progressState.token !== myToken
+    );
+    if (progressState.token === myToken) {
+      progressState.active = false;
+      renderProgress();
+    }
   }
 
   function scheduleRecompress() {
     clearTimeout(recompressTimer);
     recompressTimer = setTimeout(() => { recompressAll(); }, 160);
+  }
+
+  // ---------- F3 目标体积模式 ----------
+  async function applyTargetSize() {
+    const kb = parseFloat(targetKb.value);
+    if (!kb || kb <= 0) { toast('请输入有效的目标大小', 'warn'); return; }
+    if (formatSel.value === 'image/png') {
+      toast('PNG 为无损格式，无法通过质量降低体积，请改用 JPEG/WebP', 'warn');
+      return;
+    }
+    const targetBytes = kb * 1024;
+    const rep = items.find((i) => i.source && i.width);
+    if (!rep) { toast('请先添加图片', 'warn'); return; }
+    toast('正在计算最佳质量…');
+    let lo = 0.1, hi = 1, best = 0.1;
+    for (let i = 0; i < 6; i++) {
+      const mid = +((lo + hi) / 2).toFixed(3);
+      const p = Object.assign(getParams(), { quality: mid });
+      const { w, h } = targetSize(rep, p);
+      try {
+        const { size } = await encodeItem(rep, p, w, h);
+        if (size <= targetBytes) { best = mid; lo = mid; } else { hi = mid; }
+      } catch (_) { break; }
+    }
+    quality.value = best.toFixed(2);
+    qualityValue.textContent = best.toFixed(2);
+    toast(`已设为最佳质量 ${best.toFixed(2)}`, 'ok');
+    scheduleRecompress();
   }
 
   // ---------- Events ----------
@@ -728,17 +898,14 @@
     const dt = e.dataTransfer;
     if (dt && dt.files && dt.files.length) addFiles(dt.files);
   });
-  // 阻止整个窗口的默认拖放打开行为
   window.addEventListener('dragover', (e) => e.preventDefault());
   window.addEventListener('drop', (e) => e.preventDefault());
 
-  // 质量
   quality.addEventListener('input', () => {
     qualityValue.textContent = parseFloat(quality.value).toFixed(2);
     scheduleRecompress();
   });
 
-  // 格式
   function updateFormatUI() {
     const f = formatSel.value;
     const isPng = f === 'image/png';
@@ -752,7 +919,6 @@
   }
   formatSel.addEventListener('change', () => { updateFormatUI(); scheduleRecompress(); });
 
-  // 尺寸模式切换
   segBtns.forEach((btn) => {
     btn.addEventListener('click', () => {
       segBtns.forEach((b) => { b.classList.remove('active'); b.setAttribute('aria-selected', 'false'); });
@@ -765,15 +931,57 @@
     });
   });
 
-  // 尺寸输入
   [percentInput, maxWInput, maxHInput].forEach((inp) =>
     inp.addEventListener('input', scheduleRecompress)
   );
 
+  // 目标体积
+  targetToggle.addEventListener('change', () => {
+    targetFields.classList.toggle('hidden', !targetToggle.checked);
+  });
+  applyTarget.addEventListener('click', applyTargetSize);
+
   $('#downloadAll').addEventListener('click', downloadAll);
   $('#clearAll').addEventListener('click', clearAll);
+  stopBtn.addEventListener('click', () => {
+    progressState.token++;
+    progressState.active = false;
+    renderProgress();
+    toast('已停止处理', 'warn');
+  });
+
+  // ---------- U2 暗色主题 ----------
+  function applyTheme(theme) {
+    if (theme === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
+    else document.documentElement.removeAttribute('data-theme');
+    if (themeToggle) themeToggle.setAttribute('aria-pressed', String(theme === 'dark'));
+  }
+  function initTheme() {
+    let saved = null;
+    try { saved = localStorage.getItem('tinyshot-theme'); } catch (_) {}
+    if (!saved) {
+      saved = (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+    }
+    applyTheme(saved);
+  }
+  if (themeToggle) {
+    themeToggle.addEventListener('click', () => {
+      const next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      applyTheme(next);
+      try { localStorage.setItem('tinyshot-theme', next); } catch (_) {}
+    });
+  }
+
+  // ---------- U3 移动端抽屉 ----------
+  if (paramsFab) {
+    paramsFab.addEventListener('click', () => document.body.classList.toggle('params-open'));
+  }
+  if (paramsClose) {
+    paramsClose.addEventListener('click', () => document.body.classList.remove('params-open'));
+  }
 
   // ---------- Init ----------
+  initWorker();
   if (!supportsWebpEncode()) {
     const opt = formatSel.querySelector('option[value="image/webp"]');
     if (opt) {
@@ -782,6 +990,7 @@
     }
     if (formatSel.value === 'image/webp') formatSel.value = 'image/jpeg';
   }
+  initTheme();
   updateFormatUI();
   refreshEmptyState();
 })();
